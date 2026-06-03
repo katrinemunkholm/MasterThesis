@@ -1,0 +1,1055 @@
+---
+title: "codeforproject"
+author: "Katrine Munkholm"
+date: "2026-06-03"
+output: html_document
+---
+
+```{r}
+pacman::p_load( "tidyverse",
+  "lubridate",
+  "httr2",
+  "jsonlite",
+  "rsample",
+  "caret",
+  "yardstick",
+  "car",
+  "ggtext",
+  "scales")
+```
+
+#Read CSV
+
+```{r}
+Zdf <- read_csv2("data.csv")
+```
+
+
+#ENGINEERED VARIABLES
+#Create column with journey ID for each unique journey, connecting individual records.
+```{r}
+Zdf <- Zdf %>%
+  group_by(FORSTE_KOREDATO, TOGNUMMER, DELSTR_RETNING) %>%
+  mutate(JOURNEY_ID = cur_group_id()) %>%
+  ungroup()
+```
+
+#Create column for type of day. 1 = weekdays, 0 = weekends
+```{r}
+Zdf <- Zdf %>%
+  mutate(
+    FORSTE_KOREDATO = dmy(FORSTE_KOREDATO),
+    WEEKDAY = if_else(
+      wday(FORSTE_KOREDATO, week_start = 1) <= 5,
+      1,
+      0
+    )
+  )
+```
+
+
+#WEATHER SPECIFIC
+#1 Create tribble for coordinates (For obtaining weather data)
+
+```{r}
+stations <- tribble(
+  ~STAT_KODE, ~station_name, ~latitude,   ~longitude,
+  "FA",       "Fredericia",  55.5682297,  9.7399931,
+  "VJ",       "Vejle",       55.706389,   9.536944,
+  "SD",       "Skanderborg", 56.043219,   9.924794,
+  "AR",       "Aarhus",      56.150000,  10.204722
+)
+```
+
+#Add coordinates to df by STAT_KODE
+```{r}
+Zdf <- Zdf %>%
+  left_join(stations, by = "STAT_KODE")
+```
+
+#Create columns for correct date/time format for Open-Meteo to obtain weather data
+```{r}
+Zdf <- Zdf %>%
+  mutate(
+    PLANTID_datetime = lubridate::dmy_hm(
+      PLANTID,
+      tz = "Europe/Copenhagen"
+    ),
+
+    WEATHER_HOUR = format(
+      lubridate::round_date(
+        PLANTID_datetime,
+        unit = "hour"
+      ),
+      "%Y-%m-%dT%H:%M"
+    ),
+    HOUR_OF_DAY = factor(
+      format(PLANTID_datetime, "%H"),
+      levels = sprintf("%02d", 0:23),
+      ordered = TRUE
+    )
+  )
+```
+
+#Retrieve hourly weather information
+```{r}
+get_weather_openmeteo <- function(lat, lon, start_date, end_date, station_code) {
+  
+  hourly_vars <- c(
+    "temperature_2m",
+    "precipitation",
+    "snowfall",
+    "weather_code",
+    "wind_speed_10m",
+    "surface_pressure"
+  )
+  
+  resp <- request("https://archive-api.open-meteo.com/v1/archive") %>%
+    req_url_query(
+      latitude = lat,
+      longitude = lon,
+      start_date = start_date,
+      end_date = end_date,
+      hourly = paste(hourly_vars, collapse = ","),
+      timezone = "Europe/Copenhagen",
+      models = "era5"
+    ) %>%
+    req_perform() %>%
+    resp_body_string()
+  
+  parsed <- fromJSON(resp, simplifyDataFrame = TRUE)
+  
+  weather <- as_tibble(parsed$hourly)
+  names(weather)[1] <- "WEATHER_HOUR"
+  
+  weather %>%
+    mutate(
+      WEATHER_HOUR = as.POSIXct(
+  WEATHER_HOUR,
+  format = "%Y-%m-%dT%H:%M",
+  tz = "Europe/Copenhagen"
+),
+      STAT_KODE = station_code
+    )
+}
+
+weather_df <- pmap_dfr(
+  list(stations$latitude, stations$longitude, stations$STAT_KODE),
+  ~ get_weather_openmeteo(..1, ..2, "2025-01-01", "2025-12-31", ..3)
+)
+
+weather_df <- weather_df %>%
+  mutate(
+    WEATHER_HOUR = format(WEATHER_HOUR, "%Y-%m-%dT%H:%M")
+  )
+```
+
+#Mutate time to correct format
+```{r}
+weather_df <- weather_df %>%
+  mutate(
+    WEATHER_HOUR = as.POSIXct(
+      WEATHER_HOUR,
+      format = "%Y-%m-%dT%H:%M",
+      tz = "Europe/Copenhagen"
+    )
+  )
+
+Zdf <- Zdf %>%
+  mutate(
+    WEATHER_HOUR = as.POSIXct(
+      WEATHER_HOUR,
+      format = "%Y-%m-%dT%H:%M",
+      tz = "Europe/Copenhagen"
+    )
+  )
+
+#Check they are both "POSIXct" "POSIXt"
+class(Zdf$WEATHER_HOUR)
+class(weather_df$WEATHER_HOUR)
+```
+
+#Add the weather information to the main df
+```{r}
+Xdf <- Zdf %>%
+  left_join(
+    weather_df,
+    by = c("STAT_KODE", "WEATHER_HOUR"), relationship = "many-to-many"
+  )
+```
+
+#Create variable for the ARS_GRP_KODE at the previous record
+```{r}
+Xdf <- Xdf %>%
+  arrange(JOURNEY_ID, PLANTID_datetime) %>%
+  group_by(JOURNEY_ID) %>%
+  mutate(
+    PREVIOUS_ARS_GRP_KODE =
+      lag(ARS_GRP_KODE) %>%
+      coalesce("NONE") %>%
+      factor()
+  ) %>%
+  ungroup()
+```
+
+#Create cancelled variable for every record
+```{r}
+Xdf <- Xdf %>%
+  mutate(
+    CANCELLED = factor(
+      if_else(MLD_KAT_KODE %in% c("A"), "1", "0"),
+      levels = c("0", "1")
+    )
+  )
+#Checking the proportions
+table(Xdf$CANCELLED)
+prop.table(table(Xdf$CANCELLED))
+```
+
+#Create variable indicating if the train was cancelled at the previous station
+```{r}
+Xdf <- Xdf %>%
+  group_by(JOURNEY_ID) %>%
+  arrange(PLANTID) %>%
+  mutate(
+    PREVIOUS_CANCELLED =
+      lag(
+        CANCELLED,
+        default = factor("0", levels = levels(CANCELLED))
+      )
+  ) %>%
+  ungroup()
+```
+
+#Create previous delay variable
+```{r}
+Xdf <- Xdf %>%
+  arrange(JOURNEY_ID, PLANTID_datetime) %>%
+  group_by(JOURNEY_ID) %>%
+  mutate(
+    PREVIOUS_DELAY =
+      lag(PLANAFVIGELSE)
+  ) %>%
+  ungroup()
+```
+
+
+#Make sure NAs match no. of journeys 
+```{r}
+Xdf %>%
+  summarise(
+    unique_journeys = n_distinct(JOURNEY_ID),
+    n_na_previous_delay = sum(is.na(PREVIOUS_DELAY)),
+    difference = n_na_previous_delay - unique_journeys
+  )
+```
+
+#...and set NAs to 0
+```{r}
+Xdf <- Xdf %>%
+  mutate(
+    PREVIOUS_DELAY =
+      ifelse(
+        is.na(PREVIOUS_DELAY),
+        0,
+        PREVIOUS_DELAY
+      )
+  )
+```
+
+#Create cumulated delay variable
+```{r}
+Xdf <- Xdf %>%
+  arrange(JOURNEY_ID, PLANTID) %>%
+  group_by(JOURNEY_ID) %>%
+  mutate(
+    CUMULATED_DELAY = lag(cumsum(PLANAFVIGELSE), default = 0)
+  ) %>%
+  ungroup()
+```
+
+#Mutate variables to factors
+```{r}
+Xdf <- Xdf %>%
+  mutate(
+    STAT_KODE = as.factor(STAT_KODE),
+    PROD_KODE = as.factor(PROD_KODE),
+    OD_STRK = as.factor(OD_STRK),
+    DELSTR_RETNING = as.factor(DELSTR_RETNING),
+    WEEKDAY = as.factor(WEEKDAY),
+    CANCELLED = as.factor(CANCELLED),
+    ARS_GRP_KODE = as.factor(ARS_GRP_KODE),
+    MLD_TYP_KODE = as.factor(MLD_TYP_KODE),
+    JOURNEY_ID = as.factor(JOURNEY_ID)
+  )
+```
+
+
+#INSPECTION SECTION
+#Planafvigelse, quantiles
+```{r}
+summary(Xdf$PLANAFVIGELSE)
+
+quantile(
+  Xdf$PLANAFVIGELSE,
+  probs = c(
+    0.90,
+    0.95,
+    0.975,
+    0.99,
+    0.995,
+    0.999
+  ),
+  na.rm = TRUE
+)
+```
+
+#Trains that are cancelled but not replaced
+```{r, eval=FALSE}
+Xdf %>%
+  summarise(
+    total_records = n(),
+
+    cancelled_not_replaced =
+      sum(
+        MLD_KAT_KODE %in% c("A", "Z") &
+        AFLYSNINGSKODE_EVAL !=
+          "Erstattet af andet rettidigt tog",
+        na.rm = TRUE
+      ),
+
+    percent_of_all_records =
+      100 * cancelled_not_replaced / total_records
+  )
+
+```
+
+#How many journeys have changes in delay?
+```{r}
+Xdf %>%
+  group_by(JOURNEY_ID) %>%
+  summarise(
+    delay_changes =
+      n_distinct(PLANAFVIGELSE),
+    .groups = "drop"
+  ) %>%
+  summarise(
+    journeys_with_change =
+      sum(delay_changes > 1),
+    total_journeys = n(),
+    proportion =
+      journeys_with_change / total_journeys
+  )
+```
+
+#How many journeys get cancelled during the records, i.e. has partial cancellation?
+```{r}
+journeys_with_A_and_K <-
+  Xdf %>%
+  group_by(JOURNEY_ID) %>%
+  summarise(
+    has_A = any(MLD_KAT_KODE == "A"),
+    has_K = any(MLD_KAT_KODE == "K"),
+    .groups = "drop"
+  ) %>%
+  filter(has_A & has_K)
+
+nrow(journeys_with_A_and_K)
+```
+
+#FILTERING
+#Make list with journeys valid for the modeling. Journeys that has at least one "K" (Konstateret) is included. Check number compared to before.
+```{r}
+valid_journeys <- Xdf %>%
+  group_by(JOURNEY_ID) %>%
+  summarise(
+    has_K = any(MLD_KAT_KODE == "K"),
+    .groups = "drop"
+  ) %>%
+  filter(has_K) %>%
+  pull(JOURNEY_ID)
+```
+
+
+#Create final df, filtering out invalid journeys defined earllier (Journeys with no "K" in MLD_KAT_KODE), and keeping only records where the train was not cancelled at the previous station
+```{r}
+filtered_df <- Xdf %>%
+  filter(
+    JOURNEY_ID %in% valid_journeys,
+    PREVIOUS_CANCELLED == "0"
+  )
+```
+
+
+
+#CREATE SUBSET WITH ONLY ONE RECORD PER JOURNEY
+```{r}
+filtered_df_one_record <- filtered_df |>
+  group_by(JOURNEY_ID) |>
+  group_modify(\(.x, .y) {
+    if (any(.x$CANCELLED == 1, na.rm = TRUE)) {
+      .x |>
+        filter(CANCELLED == 1) |>
+        slice_sample(n = 1)
+    } else {
+      .x |>
+        slice_sample(n = 1)
+    }
+  }) |>
+  ungroup()
+```
+
+
+#Check for specific routes that are only represented once
+```{r}
+filtered_df_one_record %>%
+  group_by(OD_STRK) %>%
+  filter(n_distinct(JOURNEY_ID) == 1) %>%
+  distinct(OD_STRK)
+
+```
+
+#6 cases - remove these
+```{r}
+filtered_df_one_record <- filtered_df_one_record %>%
+  group_by(OD_STRK) %>%
+  filter(n_distinct(JOURNEY_ID) > 1) %>%
+  ungroup()
+
+filtered_df_one_record <- filtered_df_one_record |>
+  filter(
+    !is.na(HOUR_OF_DAY),
+    !is.na(temperature_2m)
+  )
+```
+
+# check
+
+```{r}
+filtered_df_one_record |>
+  summarise(
+    n_records = n(),
+    n_journeys = n_distinct(JOURNEY_ID),
+    n_cancelled = sum(CANCELLED == 1, na.rm = TRUE),
+    cancellation_rate = mean(CANCELLED == 1, na.rm = TRUE)
+  )
+```
+
+#check that no journeys are represented multiple times
+```{r}
+filtered_df_one_record |>
+  count(JOURNEY_ID) |>
+  filter(n > 1)
+```
+
+
+#CREATE TRAIN/TEST SPLIT WITH ONE RECORD PER JOURNEY_ID
+```{r}
+set.seed(150)
+
+journey_level_one_record <- filtered_df_one_record %>%
+  group_by(JOURNEY_ID) %>%
+  summarise(
+    journey_cancelled = factor(
+      as.integer(any(CANCELLED == "1")),
+      levels = c(0, 1)
+    ),
+    .groups = "drop"
+  )
+
+journey_split_one_record <- initial_split(
+  journey_level_one_record,
+  prop = 0.8,
+  strata = journey_cancelled
+)
+
+train_data_one_record <- filtered_df_one_record %>%
+  semi_join(
+    training(journey_split_one_record) %>% select(JOURNEY_ID),
+    by = "JOURNEY_ID"
+  ) %>%
+  mutate(JOURNEY_ID = factor(JOURNEY_ID))
+
+test_data_one_record <- filtered_df_one_record %>%
+  semi_join(
+    testing(journey_split_one_record) %>% select(JOURNEY_ID),
+    by = "JOURNEY_ID"
+  ) %>%
+  mutate(JOURNEY_ID = factor(JOURNEY_ID))
+```
+
+
+# cross-validation 
+
+```{r}
+# Create df for selected predictors
+cv_data <- train_data_one_record %>%
+  select(
+    CANCELLED,
+    PREVIOUS_DELAY,
+    STAT_KODE,
+    MLD_TYP_KODE,
+    WEEKDAY,
+    HOUR_OF_DAY,
+    CUMULATED_DELAY,
+    temperature_2m
+  ) %>%
+  tidyr::drop_na() %>%
+  mutate(
+    CANCELLED = as.numeric(as.character(CANCELLED))
+  )
+
+# Check outcome
+table(cv_data$CANCELLED)
+prop.table(table(cv_data$CANCELLED))
+
+# Create stratified folds from cv_data
+set.seed(150)
+
+folds <- caret::createFolds(
+  y = factor(cv_data$CANCELLED),
+  k = 5,
+  list = TRUE,
+  returnTrain = FALSE
+)
+
+# 3. Define formulas
+model_formulas <- list(
+  Model_1 = CANCELLED ~ PREVIOUS_DELAY,
+  
+  Model_2 = CANCELLED ~ PREVIOUS_DELAY + STAT_KODE,
+  
+  Model_3 = CANCELLED ~ PREVIOUS_DELAY +
+    STAT_KODE +
+    CUMULATED_DELAY +
+    MLD_TYP_KODE +
+    WEEKDAY +
+    HOUR_OF_DAY +
+    temperature_2m
+)
+```
+
+
+```{r}
+cv_glm_metrics_folds <- function(model_formula, data, folds, model_name) {
+  
+  purrr::map_dfr(seq_along(folds), function(i) {
+    
+    valid_idx <- folds[[i]]
+    
+    train_fold <- data[-valid_idx, ]
+    valid_fold <- data[valid_idx, ]
+    
+    model_fit <- glm(
+      model_formula,
+      data = train_fold,
+      family = binomial
+    )
+    
+    pred_prob <- predict(
+      model_fit,
+      newdata = valid_fold,
+      type = "response"
+    )
+    
+    eps <- 1e-15
+    pred_prob <- pmin(pmax(pred_prob, eps), 1 - eps)
+    
+    y <- valid_fold$CANCELLED
+    
+    # Brier score
+    brier <- mean((y - pred_prob)^2)
+    
+    # PR-AUC
+    pr_data <- tibble(
+      truth = factor(y, levels = c(1, 0)),
+      .pred_1 = pred_prob
+    )
+    
+    pr_auc_value <- yardstick::pr_auc(
+      pr_data,
+      truth = truth,
+      .pred_1,
+      event_level = "first"
+    )$.estimate
+    
+    # McFadden's pseudo-R2 on validation fold
+    ll_model <- sum(y * log(pred_prob) + (1 - y) * log(1 - pred_prob))
+    
+    p_null <- mean(train_fold$CANCELLED)
+    p_null <- pmin(pmax(p_null, eps), 1 - eps)
+    
+    ll_null <- sum(y * log(p_null) + (1 - y) * log(1 - p_null))
+    
+    mcfadden_r2 <- 1 - (ll_model / ll_null)
+    
+    tibble(
+      model = model_name,
+      fold = i,
+      mcfadden_r2 = mcfadden_r2,
+      pr_auc = pr_auc_value,
+      brier = brier,
+      aic = AIC(model_fit)
+    )
+  })
+}
+```
+
+
+```{r}
+#Evaluate each model across the 5 folds 
+cv_fold_results <- purrr::map_dfr(
+  names(model_formulas),
+  function(model_name) {
+    cv_glm_metrics_folds(
+      model_formula = model_formulas[[model_name]],
+      data = cv_data,
+      folds = folds,
+      model_name = model_name
+    )
+  }
+)
+
+cv_fold_results
+```
+
+```{r}
+#summarize cv performance across folds
+cv_results2 <- cv_fold_results %>%
+  group_by(model) %>%
+  summarise(
+    mean_mcfadden_r2 = mean(mcfadden_r2, na.rm = TRUE),
+    sd_mcfadden_r2 = sd(mcfadden_r2, na.rm = TRUE),
+    mean_pr_auc = mean(pr_auc, na.rm = TRUE),
+    sd_pr_auc = sd(pr_auc, na.rm = TRUE),
+    mean_brier = mean(brier, na.rm = TRUE),
+    sd_brier = sd(brier, na.rm = TRUE),
+    mean_aic = mean(aic, na.rm = TRUE),
+    sd_aic = sd(aic, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cv_results2
+```
+
+```{r}
+#Compute baseline values
+baseline_fold_results <- purrr::map_dfr(seq_along(folds), function(i) {
+  
+  valid_idx <- folds[[i]]
+  
+  train_fold <- cv_data[-valid_idx, ]
+  valid_fold <- cv_data[valid_idx, ]
+  
+  y_valid <- valid_fold$CANCELLED
+  
+  eps <- 1e-15
+  
+  #Baseline probability = cancellation prevalence in training fold
+  p_null <- mean(train_fold$CANCELLED)
+  p_null <- pmin(pmax(p_null, eps), 1 - eps)
+  
+  # Null model for AIC baseline
+  null_model <- glm(
+    CANCELLED ~ 1,
+    data = train_fold,
+    family = binomial
+  )
+  
+  tibble(
+    fold = i,
+    pr_auc_baseline = mean(y_valid),
+    brier_baseline = mean((y_valid - p_null)^2),
+    mcfadden_r2_baseline = 0
+  )
+})
+
+baseline_summary <- baseline_fold_results %>%
+  summarise(
+    pr_auc_baseline = mean(pr_auc_baseline, na.rm = TRUE),
+    brier_baseline = mean(brier_baseline, na.rm = TRUE),
+    mcfadden_r2_baseline = mean(mcfadden_r2_baseline, na.rm = TRUE)
+  )
+
+baseline_summary
+```
+
+#Summary plot, cross-validated evaluation metrics
+```{r}
+metric_colors <- c(
+  "AIC<br><span style='font-size:9pt'>(lower is better)</span>" = "#E68613",          
+  "Brier score<br><span style='font-size:9pt'>(lower is better)</span>" = "#2C7FB8", 
+  "McFadden's pseudo-R²<br><span style='font-size:9pt'>(higher is better)</span>" = "#7B3294", 
+  "PR-AUC<br><span style='font-size:9pt'>(higher is better)</span>" = "#D33682"      
+)
+
+#Prepare plot data
+plot_data <- cv_fold_results %>%
+  pivot_longer(
+    cols = c(mcfadden_r2, pr_auc, brier, aic),
+    names_to = "metric_raw",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = case_when(
+      metric_raw == "mcfadden_r2" ~ "McFadden's pseudo-R²<br><span style='font-size:9pt'>(higher is better)</span>",
+      metric_raw == "pr_auc" ~ "PR-AUC<br><span style='font-size:9pt'>(higher is better)</span>",
+      metric_raw == "brier" ~ "Brier score<br><span style='font-size:9pt'>(lower is better)</span>",
+      metric_raw == "aic" ~ "AIC<br><span style='font-size:9pt'>(lower is better)</span>",
+      TRUE ~ metric_raw
+    ),
+    model = case_when(
+      model == "Model_1" ~ "Model 1",
+      model == "Model_2" ~ "Model 2",
+      model == "Model_3" ~ "Model 3",
+      TRUE ~ model
+    ),
+    model = factor(model, levels = c("Model 1", "Model 2", "Model 3")),
+    metric = factor(metric, levels = names(metric_colors))
+  )
+
+#Baselines
+baseline_data <- tibble(
+  metric_raw = c("mcfadden_r2", "pr_auc", "brier"),
+  baseline = c(
+    baseline_summary$mcfadden_r2_baseline,
+    baseline_summary$pr_auc_baseline,
+    baseline_summary$brier_baseline
+  )
+) %>%
+  mutate(
+    metric = case_when(
+      metric_raw == "mcfadden_r2" ~ "McFadden's pseudo-R²<br><span style='font-size:9pt'>(higher is better)</span>",
+      metric_raw == "pr_auc" ~ "PR-AUC<br><span style='font-size:9pt'>(higher is better)</span>",
+      metric_raw == "brier" ~ "Brier score<br><span style='font-size:9pt'>(lower is better)</span>",
+      TRUE ~ metric_raw
+    ),
+    metric = factor(metric, levels = names(metric_colors))
+  )
+
+# Plot
+cv_plot <- ggplot(plot_data, aes(x = model, y = value, color = metric)) +
+  geom_hline(
+    data = baseline_data,
+    aes(yintercept = baseline, color = metric),
+    linetype = "dashed",
+    linewidth = 0.55,
+    alpha = 0.7,
+    inherit.aes = FALSE
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    size = 2.1
+  ) +
+  stat_summary(
+    fun.data = mean_sdl,
+    fun.args = list(mult = 1),
+    geom = "errorbar",
+    width = 0.14,
+    linewidth = 0.6
+  ) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  scale_color_manual(values = metric_colors, guide = "none") +
+  labs(
+    x = "GLM specification",
+    y = "Metric Value",
+    title = "Cross-validated comparison of GLM specifications",
+    subtitle = "Points show mean performance across folds; error bars show ±1 SD; dashed lines show relevant baselines"
+  ) +
+  theme_minimal(base_size = 12) +
+theme(
+  plot.title = element_text(face = "bold", size = 14),
+  plot.subtitle = element_text(size = 10),
+  
+  strip.text = ggtext::element_markdown(
+    face = "bold",
+    size = 11,
+    margin = margin(t = 3, r = 3, b = 1, l = 3)
+  ),
+  
+  panel.border = element_rect(
+    color = "grey70",
+    fill = NA,
+    linewidth = 0.5
+  ),
+  panel.spacing = unit(1.2, "lines"),
+  
+  panel.grid.major.y = element_line(
+    color = "grey88",
+    linewidth = 0.35
+  ),
+  panel.grid.minor.y = element_line(
+    color = "grey94",
+    linewidth = 0.25
+  ),
+  panel.grid.major.x = element_line(
+    color = "grey92",
+    linewidth = 0.25
+  ),
+  panel.grid.minor.x = element_blank(),
+  
+  axis.text.x = element_text(size = 10),
+  axis.text.y = element_text(size = 9.5),
+  axis.title = element_text(size = 11)
+)
+
+cv_plot
+```
+
+
+
+#GVIF for model 3
+
+```{r}
+# Model 3
+model_3 <- glm(
+  CANCELLED ~ PREVIOUS_DELAY +
+    STAT_KODE +
+    CUMULATED_DELAY +
+    MLD_TYP_KODE +
+    WEEKDAY +
+    HOUR_OF_DAY +
+    temperature_2m,
+  data = train_data_one_record,
+  family = binomial
+)
+
+vif(model_3)
+```
+
+
+
+#UPDATED EVALUATION FOR MODEL 3
+
+```{r}
+summary(model_3)
+
+# McFadden's pseudo-R² for model_3
+
+null_model_3 <- glm(
+  CANCELLED ~ 1,
+  data = train_data_one_record,
+  family = binomial()
+)
+
+mcfadden_r2_model_3 <- 1 - as.numeric(logLik(model_3) / logLik(null_model_3))
+
+mcfadden_r2_model_3
+
+# Predict on held-out test set
+
+test_data_one_record <- test_data_one_record %>%
+  mutate(
+    pred_prob = predict(
+      model_3,
+      newdata = test_data_one_record,
+      type = "response"
+    ),
+    CANCELLED = factor(CANCELLED, levels = c("0", "1")),
+    y_numeric = as.numeric(CANCELLED == "1")
+  )
+
+
+# Test-set performance metrics
+
+
+pr_auc_test_model_3 <- pr_auc_vec(
+  truth = test_data_one_record$CANCELLED,
+  estimate = test_data_one_record$pred_prob,
+  event_level = "second"
+)
+
+
+brier_test_model_3 <- mean(
+  (test_data_one_record$pred_prob - test_data_one_record$y_numeric)^2
+)
+
+baseline_prob <- mean(train_data_one_record$CANCELLED == "1")
+
+brier_baseline_test <- mean(
+  (baseline_prob - test_data_one_record$y_numeric)^2
+)
+
+model_3_test_metrics <- tibble(
+  model = "Model 3",
+  McFadden_R2 = mcfadden_r2_model_3,
+  PR_AUC = pr_auc_test_model_3,
+  Brier_score = brier_test_model_3,
+  Brier_baseline = brier_baseline_test
+)
+
+model_3_test_metrics
+
+
+#  drop1 likelihood-ratio test for model_3
+
+
+drop1_model_3 <- drop1(
+  model_3,
+  test = "Chisq"
+)
+
+drop1_model_3
+#seed was not set for creating the filtered_df_one_record which might create slightly different results when re-running
+```
+
+
+#Calibration plot, 20 bins
+```{r}
+model_col <- "#0072B2"
+
+test_data_one_record %>%
+  mutate(pred_bin = ntile(pred_prob, 20)) %>%
+  group_by(pred_bin) %>%
+  summarise(
+    mean_predicted = mean(pred_prob, na.rm = TRUE),
+    observed_rate = mean(CANCELLED == "1", na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = mean_predicted, y = observed_rate)) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    linewidth = 0.8,
+    colour = "grey55"
+  ) +
+  geom_line(
+    colour = model_col,
+    linewidth = 1.2
+  ) +
+ geom_point(
+  colour = model_col,
+  fill = "white",
+  shape = 21,
+  size = 1.5,
+  stroke = 1.2,
+  alpha = 0.9
+) +
+  scale_x_continuous(
+    trans = pseudo_log_trans(sigma = 0.003),
+    labels = percent_format(accuracy = 0.1)
+  ) +
+  scale_y_continuous(
+    trans = pseudo_log_trans(sigma = 0.003),
+    labels = percent_format(accuracy = 0.1)
+  ) +
+  scale_size_continuous(
+    range = c(2.5, 6),
+    guide = "none"
+  ) +
+  labs(
+    x = "Mean predicted cancellation probability",
+    y = "Observed cancellation rate",
+    title = "Calibration plot for Model 3",
+    subtitle = "Predictions are grouped into 20 equally sized bins, represented by the dots",
+    caption = "Dashed line indicates perfect calibration"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11, colour = "grey35"),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+
+#seed was not set for creating the filtered_df_one_record which might create slightly different results when re-running
+
+```
+
+
+#Quantiles probability for each class
+```{r}
+quantile(
+  test_data_one_record$pred_prob[test_data_one_record$CANCELLED == 0],
+  probs = c(.5, .9, .95, .99),
+  na.rm = TRUE
+)
+
+quantile(
+  test_data_one_record$pred_prob[test_data_one_record$CANCELLED == 1],
+  probs = c(.5, .9, .95, .99),
+  na.rm = TRUE
+)
+```
+
+
+#Visualization of predicted probabilities for outcome class, quantiles
+```{r}
+quantile_plot_data <- test_data_one_record %>%
+  mutate(
+    outcome = if_else(
+      as.character(CANCELLED) == "1",
+      "Cancelled",
+      "Not cancelled"
+    )
+  ) %>%
+  group_by(outcome) %>%
+  summarise(
+    Median = quantile(pred_prob, probs = 0.50, na.rm = TRUE),
+    `90th percentile` = quantile(pred_prob, probs = 0.90, na.rm = TRUE),
+    `95th percentile` = quantile(pred_prob, probs = 0.95, na.rm = TRUE),
+    `99th percentile` = quantile(pred_prob, probs = 0.99, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = -outcome,
+    names_to = "quantile",
+    values_to = "predicted_probability"
+  ) %>%
+  mutate(
+    quantile = factor(
+      quantile,
+      levels = c(
+        "Median",
+        "90th percentile",
+        "95th percentile",
+        "99th percentile"
+      )
+    )
+  )
+
+#plot
+ggplot(
+  quantile_plot_data,
+  aes(
+    x = quantile,
+    y = predicted_probability,
+    group = outcome,
+    colour = outcome
+  )
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_colour_manual(
+    values = c(
+      "Cancelled" = "#7B2CBF",      
+      "Not cancelled" = "#E69F00"   
+    )
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, 0.35),
+    breaks = seq(0, 0.35, by = 0.05)
+  ) +
+  labs(
+    title = "Quantile plot: Distribution of Predicted Cancellation Probabilities",
+    x = NULL,
+    y = "Predicted cancellation probability",
+    colour = "Observed outcome"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.title.y = element_text(),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+
+
